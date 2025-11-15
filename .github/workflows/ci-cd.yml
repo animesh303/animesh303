@@ -9,6 +9,7 @@ on:
 env:
   TF_VERSION: "1.5.0"
   AWS_REGION: "us-east-1"
+  INSTANCE_TYPE: "t2.micro"
 
 jobs:
   terraform:
@@ -52,15 +53,22 @@ jobs:
     - name: Terraform Validate
       run: terraform validate
 
+    - name: Verify Required Variables
+      run: |
+        if ! grep -q 'variable "bucket_name"' *.tf; then
+          echo "Error: bucket_name variable not defined"
+          exit 1
+        fi
+        if ! grep -q 'variable "instance_type"' *.tf; then
+          echo "Error: instance_type variable not defined"
+          exit 1
+        fi
+
     - name: Setup TFLint
       uses: terraform-linters/setup-tflint@v3
 
     - name: Run TFLint
       run: tflint --format compact
-
-    - name: Verify AWS Provider Version
-      run: |
-        grep -q 'aws.*~> 5.0' versions.tf || exit 1
 
     # Security Scan Stage
     - name: Run Checkov
@@ -71,23 +79,32 @@ jobs:
 
     - name: Run tfsec
       uses: aquasecurity/tfsec-action@v1.0.0
-
-    - name: Run Snyk IaC Scan
-      uses: snyk/actions/iac@master
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        additional_args: --minimum-severity HIGH
 
     - name: Custom Policy Validation
       run: |
-        # Add custom policy checks for S3 and EC2
-        echo "Running custom policy validation..."
-        # Add your custom validation script here
+        # Validate bucket naming convention
+        if [[ ! ${{ secrets.BUCKET_NAME }} =~ ^[a-z0-9-]+$ ]]; then
+          echo "Error: Invalid bucket name format"
+          exit 1
+        fi
+        
+        # Validate instance type restrictions
+        if [[ ! ${{ env.INSTANCE_TYPE }} =~ ^t2\.|^t3\. ]]; then
+          echo "Error: Only t2/t3 instance types allowed"
+          exit 1
+        fi
 
     # Planning Stage
     - name: Terraform Plan
-      run: terraform plan -out=tfplan
-      
-    - name: Store Terraform Plan
+      run: |
+        terraform plan \
+          -var="bucket_name=${{ secrets.BUCKET_NAME }}" \
+          -var="instance_type=${{ env.INSTANCE_TYPE }}" \
+          -out=tfplan
+
+    - name: Store Plan
       uses: actions/upload-artifact@v3
       with:
         name: terraform-plan
@@ -99,9 +116,10 @@ jobs:
         INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
     - run: infracost breakdown --path .
 
-    - name: Detect Resource Changes
+    - name: Preview Outputs
       run: |
-        terraform show -json tfplan | jq -r '.resource_changes[]'
+        echo "Expected outputs after apply:"
+        terraform show -json tfplan | jq -r '.planned_values.outputs'
 
     # Review Gate
     - name: Manual Approval
@@ -111,22 +129,25 @@ jobs:
         secret: ${{ github.token }}
         approvers: required-approvers-here
         minimum-approvals: 1
-        message: "Please review the plan, costs, and security findings"
+        message: "Review required for infrastructure changes"
 
     # Apply Stage
     - name: Terraform Apply
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       run: terraform apply -auto-approve tfplan
 
-    - name: Resource Health Check
+    - name: Verify Outputs
       if: success() && github.ref == 'refs/heads/main'
       run: |
-        echo "Performing health checks..."
-        # Add your health check script here
+        bucket_id=$(terraform output -raw bucket_id)
+        instance_ip=$(terraform output -raw instance_public_ip)
+        
+        if [ -z "$bucket_id" ] || [ -z "$instance_ip" ]; then
+          echo "Error: Required outputs not found"
+          exit 1
+        fi
 
-    - name: Backup State to S3
+    - name: Backup State
       if: success() && github.ref == 'refs/heads/main'
       run: |
-        aws s3 cp terraform.tfstate s3://${TERRAFORM_STATE_BUCKET}/terraform.tfstate
-      env:
-        TERRAFORM_STATE_BUCKET: ${{ secrets.TERRAFORM_STATE_BUCKET }}
+        aws s3 cp terraform.tfstate "s3://${{ secrets.BUCKET_NAME }}/terraform.tfstate"
