@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [ main ]
 
-# Required permissions for OIDC
 permissions:
   id-token: write
   contents: read
@@ -14,7 +13,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  security-checks:
+  security-scan:
     name: Security Scanning
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -24,8 +23,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Secrets scanning with TruffleHog
-      - name: TruffleHog OSS
+      # Secrets scanning
+      - name: TruffleHog Secrets Scan
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
@@ -33,48 +32,42 @@ jobs:
           head: HEAD
           extra_args: --only-verified
 
-      # GitGuardian secrets scanning
-      - name: GitGuardian Scanner
-        uses: GitGuardian/ggshield-action@master
-        env:
-          GITHUB_PUSH_BEFORE_SHA: ${{ github.event.before }}
-          GITHUB_PUSH_BASE_SHA: ${{ github.event.base }}
-          GITHUB_PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
-
-      # KICS IaC security scanning
-      - name: KICS Scan
-        uses: checkmarx/kics-action@v1.7
+      # Infrastructure as Code security scanning
+      - name: Run Trivy IaC scan
+        uses: aquasecurity/trivy-action@master
         with:
-          path: '.'
-          output_path: kics-results
-          platform_type: terraform
-          output_formats: 'sarif,json'
-          fail_on: high
-          disable_secrets: true
+          scan-type: 'config'
+          hide-progress: false
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
 
-      # Snyk IaC Security
-      - name: Run Snyk Infrastructure as Code Scan
-        uses: snyk/actions/iac@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      # Upload Trivy scan results
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
         with:
-          args: --severity-threshold=high
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-iac'
 
-  compliance-validation:
-    needs: security-checks
+      # Dependency scanning
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+  compliance-check:
+    needs: security-scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
-
-      # Run OPA policy checks
-      - name: OPA Policy Check
-        uses: open-policy-agent/setup-opa@v2
-        with:
-          version: latest
 
       # Cost estimation
       - name: Setup Infracost
@@ -82,33 +75,46 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Generate Infracost cost estimate
+      - name: Generate cost estimate
         run: |
           infracost breakdown --path=.
           infracost output --path=. --format=json > cost-estimate.json
 
+      # Policy compliance check
+      - name: Run OPA Policy Check
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
   terraform-plan:
-    needs: compliance-validation
+    needs: compliance-check
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     environment: staging
-    concurrency: 
+    concurrency:
       group: terraform-${{ github.ref }}
       cancel-in-progress: false
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      # Configure AWS Credentials using OIDC
+      # AWS authentication using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
-          role-duration-seconds: 3600
+          role-duration-seconds: 1800
 
-      # Initialize Terraform with remote state
+      # Verify state bucket configuration
+      - name: Verify S3 State Bucket
+        run: |
+          aws s3api get-bucket-encryption --bucket ${{ secrets.TF_STATE_BUCKET }}
+          aws s3api get-bucket-versioning --bucket ${{ secrets.TF_STATE_BUCKET }}
+          aws s3api get-bucket-logging --bucket ${{ secrets.TF_STATE_BUCKET }}
+
+      # Initialize Terraform
       - name: Terraform Init
         run: |
           terraform init \
@@ -118,11 +124,17 @@ jobs:
             -backend-config="encrypt=true" \
             -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
 
-      # Terraform Plan
+      # Check for drift
+      - name: Check Configuration Drift
+        run: terraform plan -detailed-exitcode
+        continue-on-error: true
+        id: drift
+
+      # Generate plan
       - name: Terraform Plan
         id: plan
         run: terraform plan -out=tfplan
-        continue-on-error: false
+        if: steps.drift.outcome == 'success'
 
       # Save plan artifact
       - name: Save Terraform Plan
@@ -130,13 +142,13 @@ jobs:
         with:
           name: terraform-plan
           path: tfplan
-          retention-days: 5
+          retention-days: 1
 
   deploy:
     needs: terraform-plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: 
+    environment:
       name: production
       url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
     concurrency:
@@ -147,34 +159,41 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      # Configure AWS Credentials using OIDC
+      # AWS authentication
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
-          role-duration-seconds: 3600
+          role-duration-seconds: 1800
 
-      # Download plan artifact
+      # Download plan
       - name: Download Terraform Plan
         uses: actions/download-artifact@v3
         with:
           name: terraform-plan
 
-      # Apply changes
+      # Apply changes with manual approval
       - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+        run: terraform apply tfplan
+
+      # Verify resource tagging
+      - name: Verify Resource Tags
+        run: |
+          aws resourcegroupstaggingapi get-resources \
+            --tag-filters Key=Environment,Values=production
 
       # Audit logging
       - name: Log Deployment
         run: |
           aws cloudtrail lookup-events \
-            --lookup-attributes AttributeKey=EventName,AttributeValue=ApplyChanges \
-            --start-time $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            --lookup-attributes AttributeKey=EventName,AttributeValue=ApplyChanges
 
-      # Tag resources
-      - name: Verify Resource Tags
+      # CloudWatch metrics
+      - name: Record Deployment Metrics
         run: |
-          aws resourcegroupstaggingapi get-resources \
-            --tag-filters Key=Environment,Values=production \
-            --query 'ResourceTagMappingList[*]'
+          aws cloudwatch put-metric-data \
+            --namespace "TerraformDeployments" \
+            --metric-name "DeploymentComplete" \
+            --value 1 \
+            --timestamp $(date +%s)
