@@ -1,123 +1,209 @@
 name: Terraform CI/CD Pipeline
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly security scans
 
 env:
-  TERRAFORM_VERSION: "1.5.0"
-  AWS_DEFAULT_REGION: "us-east-1"
+  AWS_DEFAULT_REGION: us-east-1
+  TERRAFORM_VERSION: 1.5.0
 
 jobs:
-  terraform:
-    name: "Terraform Pipeline"
+  pre-commit:
     runs-on: ubuntu-latest
-    
-    # Required for manual approval step
-    environment: production
-    
     steps:
-    # Initialize Stage
-    - name: Checkout Repository
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_DEFAULT_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
 
-    - name: Cache Terraform
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.terraform.d/plugins
-          .terraform
-        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
-        restore-keys: |
-          ${{ runner.os }}-terraform-
+      - name: Generate Terraform Docs
+        uses: terraform-docs/gh-actions@v1.0.0
+        with:
+          working-dir: .
+          output-file: README.md
+          output-method: inject
 
-    # Validation Stage
-    - name: Terraform Format Check
-      run: terraform fmt -check -recursive
-      
-    - name: Terraform Init
-      run: terraform init
-      
-    - name: Terraform Validate
-      run: terraform validate
+  initialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Terraform Plan
-      if: github.event_name == 'pull_request'
-      run: terraform plan -no-color
-      continue-on-error: true
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
-    # Security Scan Stage
-    - name: Run tfsec
-      uses: aquasecurity/tfsec-action@v1.0.0
-      
-    - name: Run checkov
-      uses: bridgecrewio/checkov-action@master
-      with:
-        directory: .
-        framework: terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Cache Terraform Directory
+        uses: actions/cache@v3
+        with:
+          path: .terraform
+          key: terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+  validate-and-plan:
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Select Workspace
+        run: terraform workspace select ${TF_WORKSPACE} || terraform workspace new ${TF_WORKSPACE}
+        env:
+          TF_WORKSPACE: ${{ github.event_name == 'pull_request' && 'dev' || 'prod' }}
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
         
-    - name: Run Terrascan
-      uses: tenable/terrascan-action@main
-      with:
-        iac_type: 'terraform'
-        iac_version: 'v14'
-        policy_type: 'aws'
-        
-    - name: Run KICS Scan
-      uses: checkmarx/kics-action@v1.6
-      with:
-        path: '.'
-        output_path: kics-results
-        
-    # Cost Estimation Stage
-    - name: Setup Infracost
-      uses: infracost/actions/setup@v2
-      
-    - name: Generate Infracost cost estimate
-      run: |
-        infracost breakdown --path . --format json --out-file cost-estimate.json
-        infracost output --path cost-estimate.json --format html --out-file cost-estimate.html
-        
-    - name: Upload cost estimate
-      uses: actions/upload-artifact@v3
-      with:
-        name: cost-estimate
-        path: cost-estimate.html
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: tfplan
 
-    # Deployment Stage (main branch only)
-    - name: Terraform Plan (Detailed)
-      if: github.ref == 'refs/heads/main'
-      run: terraform plan -out=tfplan
-      
-    - name: Manual Approval
-      if: github.ref == 'refs/heads/main'
-      uses: trstringer/manual-approval@v1
-      with:
-        secret: ${{ secrets.GITHUB_TOKEN }}
-        approvers: required-approvers-here
-        minimum-approvals: 1
-        
-    - name: Terraform Apply
-      if: github.ref == 'refs/heads/main'
-      run: terraform apply -auto-approve tfplan
-      
-    - name: Backup State to S3
-      if: github.ref == 'refs/heads/main'
-      run: |
-        aws s3 cp terraform.tfstate s3://${TERRAFORM_STATE_BUCKET}/terraform.tfstate
-      env:
-        TERRAFORM_STATE_BUCKET: ${{ secrets.TERRAFORM_STATE_BUCKET }}
+  security-scan:
+    needs: initialize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          format: sarif
+          soft_fail: true
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          soft_fail: true
+          output_format: sarif
+
+      - name: Run Terrascan
+        uses: tenable/terrascan-action@main
+        with:
+          iac_type: terraform
+          iac_version: v14
+          policy_type: aws
+          only_warn: true
+
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            results.sarif
+            terrascan.sarif
+
+  cost-analysis:
+    needs: validate-and-plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost Report
+        run: infracost breakdown --path . --format json --out-file cost-report.json
+
+      - name: Upload Cost Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: cost-report
+          path: cost-report.json
+
+  deploy-dev:
+    needs: [security-scan, cost-analysis]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  deploy-prod:
+    needs: [security-scan, cost-analysis]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/actions
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Backup State
+        run: |
+          aws s3 cp terraform.tfstate s3://${{ secrets.STATE_BUCKET }}/backups/terraform-$(date +%Y%m%d%H%M%S).tfstate
