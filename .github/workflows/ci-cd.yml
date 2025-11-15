@@ -1,0 +1,113 @@
+name: Terraform CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  TERRAFORM_VERSION: "1.5.0"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  terraform:
+    name: "Terraform CI/CD"
+    runs-on: ubuntu-latest
+    
+    # Required for manual approval step
+    permissions:
+      pull-requests: write
+      contents: write
+      id-token: write
+
+    steps:
+    # Initial Stage
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+    - name: Cache Terraform Plugins
+      uses: actions/cache@v3
+      with:
+        path: ~/.terraform.d/plugins
+        key: ${{ runner.os }}-terraform-plugins-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+    # Validation Stage
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+      
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Run Checkov Scan
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: .
+        framework: terraform
+
+    - name: Run tfsec
+      uses: aquasecurity/tfsec-action@v1.0.0
+
+    # Planning Stage
+    - name: Terraform Plan
+      run: terraform plan -out=tfplan
+      
+    - name: Upload Plan Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-plan
+        path: tfplan
+
+    - name: Install and Run Infracost
+      uses: infracost/actions/setup@v2
+      env:
+        INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    - run: infracost breakdown --path .
+
+    # Security Scanning Stage
+    - name: Run SCA Scan
+      uses: snyk/actions/iac@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+
+    # Approval Gate
+    - name: Manual Approval
+      uses: trstringer/manual-approval@v1
+      with:
+        secret: ${{ github.token }}
+        approvers: required-approvers-here
+        minimum-approvals: 1
+        message: "Please review the Terraform plan and approve the deployment"
+
+    # Deployment Stage
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      run: terraform apply -auto-approve tfplan
+
+    - name: Backup State to S3
+      if: success() && github.ref == 'refs/heads/main'
+      run: |
+        aws s3 cp terraform.tfstate s3://${TERRAFORM_STATE_BUCKET}/terraform.tfstate
+      env:
+        TERRAFORM_STATE_BUCKET: ${{ secrets.TERRAFORM_STATE_BUCKET }}
+
+    - name: Post-Deployment Validation
+      if: success() && github.ref == 'refs/heads/main'
+      run: terraform output
