@@ -1,199 +1,142 @@
-name: Secure Infrastructure Pipeline
+name: Security and Compliance Pipeline
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *' # Daily run for continuous monitoring
 
 permissions:
-  id-token: write
   contents: read
-  security-events: write
-  pull-requests: write
+  id-token: write # Required for OIDC
 
 jobs:
-  security-scan:
-    name: Security Scanning
+  # Pre-commit checks including git-secrets
+  pre-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      # Secrets scanning
-      - name: TruffleHog Secrets Scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
+      - name: Setup git-secrets
+        run: |
+          git clone https://github.com/awslabs/git-secrets.git
+          cd git-secrets
+          sudo make install
+          git secrets --install
+          git secrets --register-aws
 
-      # Infrastructure as Code security scanning
-      - name: Run Trivy IaC scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'config'
-          hide-progress: false
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'
+      - name: Run git-secrets
+        run: git secrets --scan
 
-      # Upload Trivy scan results
-      - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-          category: 'trivy-iac'
+  # SAST and Code Analysis
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: pre-commit
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-      # Dependency scanning
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: all
+          soft_fail: false
+
+  # Container and Dependency Scanning
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: pre-commit
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-fs-results.sarif'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
-  compliance-check:
-    needs: security-scan
+      - name: Dependency scanning
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # AWS Security Configuration
+  aws-security:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    needs: [security-scan, container-scan]
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      # Cost estimation
-      - name: Setup Infracost
-        uses: infracost/actions/setup@v2
-        with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
-      - name: Generate cost estimate
-        run: |
-          infracost breakdown --path=.
-          infracost output --path=. --format=json > cost-estimate.json
-
-      # Policy compliance check
-      - name: Run OPA Policy Check
-        uses: open-policy-agent/setup-opa@v2
-        with:
-          version: latest
-
-  terraform-plan:
-    needs: compliance-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: staging
-    concurrency:
-      group: terraform-${{ github.ref }}
-      cancel-in-progress: false
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      # AWS authentication using OIDC
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
-          role-duration-seconds: 1800
 
-      # Verify state bucket configuration
-      - name: Verify S3 State Bucket
+      - name: Enable AWS Security Hub
         run: |
-          aws s3api get-bucket-encryption --bucket ${{ secrets.TF_STATE_BUCKET }}
-          aws s3api get-bucket-versioning --bucket ${{ secrets.TF_STATE_BUCKET }}
-          aws s3api get-bucket-logging --bucket ${{ secrets.TF_STATE_BUCKET }}
+          aws securityhub enable-security-hub \
+            --enable-default-standards \
+            --control-finding-generator SECURITY_CONTROL \
+            --region ${{ secrets.AWS_REGION }}
 
-      # Initialize Terraform
-      - name: Terraform Init
+      - name: Enable GuardDuty
         run: |
-          terraform init \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=terraform.tfstate" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+          aws guardduty create-detector \
+            --enable \
+            --finding-publishing-frequency FIFTEEN_MINUTES \
+            --region ${{ secrets.AWS_REGION }}
 
-      # Check for drift
-      - name: Check Configuration Drift
-        run: terraform plan -detailed-exitcode
-        continue-on-error: true
-        id: drift
+  # Compliance Reporting
+  compliance-report:
+    runs-on: ubuntu-latest
+    needs: aws-security
+    steps:
+      - name: Generate CIS Compliance Report
+        run: |
+          aws configservice get-compliance-details-by-config-rule \
+            --config-rule-name cis-aws-foundations-benchmark \
+            --region ${{ secrets.AWS_REGION }} > compliance-report.json
 
-      # Generate plan
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -out=tfplan
-        if: steps.drift.outcome == 'success'
-
-      # Save plan artifact
-      - name: Save Terraform Plan
+      - name: Upload Compliance Report
         uses: actions/upload-artifact@v3
         with:
-          name: terraform-plan
-          path: tfplan
-          retention-days: 1
+          name: compliance-report
+          path: compliance-report.json
 
-  deploy:
-    needs: terraform-plan
+  # Drift Detection
+  drift-detection:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: production
-      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-    concurrency:
-      group: production
-      cancel-in-progress: false
-
+    needs: aws-security
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      # AWS authentication
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-          role-duration-seconds: 1800
-
-      # Download plan
-      - name: Download Terraform Plan
-        uses: actions/download-artifact@v3
-        with:
-          name: terraform-plan
-
-      # Apply changes with manual approval
-      - name: Terraform Apply
-        run: terraform apply tfplan
-
-      # Verify resource tagging
-      - name: Verify Resource Tags
+      - name: Check Infrastructure Drift
         run: |
-          aws resourcegroupstaggingapi get-resources \
-            --tag-filters Key=Environment,Values=production
+          aws cloudformation detect-stack-drift \
+            --stack-name ${{ secrets.STACK_NAME }} \
+            --region ${{ secrets.AWS_REGION }}
 
-      # Audit logging
-      - name: Log Deployment
+  # Secrets Rotation
+  rotate-secrets:
+    runs-on: ubuntu-latest
+    needs: aws-security
+    steps:
+      - name: Rotate AWS Secrets
         run: |
-          aws cloudtrail lookup-events \
-            --lookup-attributes AttributeKey=EventName,AttributeValue=ApplyChanges
-
-      # CloudWatch metrics
-      - name: Record Deployment Metrics
-        run: |
-          aws cloudwatch put-metric-data \
-            --namespace "TerraformDeployments" \
-            --metric-name "DeploymentComplete" \
-            --value 1 \
-            --timestamp $(date +%s)
+          aws secretsmanager rotate-secret \
+            --secret-id ${{ secrets.SECRET_ARN }} \
+            --region ${{ secrets.AWS_REGION }}
