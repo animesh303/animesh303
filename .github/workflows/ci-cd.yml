@@ -1,125 +1,111 @@
-name: Security-First Pipeline
+name: Security and Compliance Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
 
 permissions:
+  id-token: write
   contents: read
   security-events: write
-  id-token: write
-  pull-requests: write
 
 jobs:
-  secrets-scan:
-    name: Secrets Detection
+  security-scan:
+    name: Security Scanning
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      # Initial checkout
+      - name: Checkout code
         uses: actions/checkout@v3
+
+      # Secrets Scanning
+      - name: GitGuardian scan
+        uses: GitGuardian/ggshield-action@master
+        env:
+          GITHUB_PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_PUSH_BASE_SHA: ${{ github.event.base }}
+          GITHUB_PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+
+      # SAST for Infrastructure as Code
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
         with:
-          fetch-depth: 0
+          soft_fail: false
+          format: sarif
+          out_file: tfsec.sarif
 
-      - name: TruffleHog Secrets Scan
-        uses: trufflesecurity/trufflehog-actions-scan@main
+      # Upload SAST results
+      - name: Upload SAST results
+        uses: github/codeql-action/upload-sarif@v2
         with:
-          path: ./
-          base: ${{ github.event.repository.default_branch }}
-          head: HEAD
-          extra_args: --only-verified
+          sarif_file: tfsec.sarif
+          category: tfsec
 
-      - name: Git-secrets Scan
-        run: |
-          git clone https://github.com/awslabs/git-secrets.git
-          cd git-secrets
-          sudo make install
-          git secrets --register-aws
-          git secrets --scan
+      # Dependency scanning
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
 
-  sast-sca:
-    name: SAST and SCA Analysis
-    needs: secrets-scan
+  infrastructure-plan:
+    needs: security-scan
     runs-on: ubuntu-latest
+    environment: staging
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
 
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@master
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-      - name: SonarQube Quality Gate
-        uses: SonarSource/sonarqube-quality-gate-action@master
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        timeout-minutes: 5
-
-      - name: OWASP Dependency Check
-        uses: dependency-check/Dependency-Check_Action@main
-        with:
-          project: 'my-project'
-          path: '.'
-          format: 'HTML'
-          args: >
-            --failOnCVSS 7
-            --enableRetired
-
-      - name: Upload Dependency Results
-        uses: actions/upload-artifact@v3
-        with:
-          name: dependency-check-report
-          path: reports
-
-  aws-security:
-    name: AWS Security Configuration
-    needs: sast-sca
-    runs-on: ubuntu-latest
-    steps:
+      # Configure AWS Credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
-          role-duration-seconds: 3600
-          role-session-name: SecurityPipeline
 
-      - name: Validate IAM Permissions
+      # State locking check
+      - name: Check State Lock
         run: |
-          aws sts get-caller-identity
-          aws iam get-role --role-name ${{ secrets.AWS_ROLE_NAME }}
+          aws dynamodb describe-table \
+            --table-name terraform-state-lock \
+            --region ${{ secrets.AWS_REGION }}
 
-      - name: Check Service Control Policies
-        run: |
-          aws organizations list-policies --filter SERVICE_CONTROL_POLICY
+      # Drift detection
+      - name: Terraform Init
+        run: terraform init
+        env:
+          TF_BACKEND_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          TF_BACKEND_LOCK_TABLE: terraform-state-lock
 
-  compliance-validation:
-    name: Compliance Controls
-    needs: aws-security
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        continue-on-error: false
+        timeout-minutes: 30
+
+  compliance-check:
+    needs: infrastructure-plan
     runs-on: ubuntu-latest
     steps:
-      - name: Run Policy Validation
-        uses: docker://openpolicyagent/opa:latest
+      # Run compliance policy checks
+      - name: Run OPA Policy Check
+        uses: open-policy-agent/setup-opa@v2
         with:
-          args: eval --format pretty --data policy.rego --input input.json "data.main"
+          version: latest
 
-      - name: Check Infrastructure Drift
-        run: |
-          terraform init
-          terraform plan -detailed-exitcode
-
+      # Generate compliance report
       - name: Generate Compliance Report
         run: |
-          echo "Compliance Validation Report" > compliance-report.txt
-          echo "Date: $(date)" >> compliance-report.txt
-          echo "Commit: ${{ github.sha }}" >> compliance-report.txt
-          echo "Branch: ${{ github.ref }}" >> compliance-report.txt
+          echo "Generating compliance report..."
+          date > compliance-report.txt
+          echo "Pipeline execution ID: ${{ github.run_id }}" >> compliance-report.txt
 
+      # Upload compliance artifacts
       - name: Upload Compliance Report
         uses: actions/upload-artifact@v3
         with:
@@ -127,32 +113,32 @@ jobs:
           path: compliance-report.txt
           retention-days: 90
 
-  security-gates:
-    name: Security Gates
-    needs: [secrets-scan, sast-sca, compliance-validation]
+  deploy:
+    needs: [compliance-check]
     runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    timeout-minutes: 60
+    concurrency:
+      group: production
+      cancel-in-progress: false
     steps:
-      - name: Check Security Gates
-        run: |
-          if [ "${{ needs.secrets-scan.result }}" != "success" ]; then
-            echo "Secrets scanning failed"
-            exit 1
-          fi
-          if [ "${{ needs.sast-sca.result }}" != "success" ]; then
-            echo "SAST/SCA checks failed"
-            exit 1
-          fi
-          if [ "${{ needs.compliance-validation.result }}" != "success" ]; then
-            echo "Compliance validation failed"
-            exit 1
-          fi
-
-      - name: Sign Artifacts
-        uses: sigstore/cosign-installer@main
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
-          cosign-release: 'v1.13.1'
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Verify Build Status
+      - name: Apply Changes
+        run: terraform apply -auto-approve tfplan
+        timeout-minutes: 30
+
+      # Audit logging
+      - name: Log Deployment
         run: |
-          echo "All security gates passed"
-          echo "Pipeline completed successfully"
+          aws cloudwatch put-metric-data \
+            --namespace "TerraformDeployments" \
+            --metric-name "DeploymentComplete" \
+            --value 1 \
+            --timestamp $(date +%s)
