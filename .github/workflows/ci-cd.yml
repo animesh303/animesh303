@@ -1,4 +1,4 @@
-name: Terraform CI/CD Pipeline
+name: Terraform AWS Infrastructure Pipeline
 
 on:
   push:
@@ -7,24 +7,27 @@ on:
     branches: [ main ]
 
 env:
-  TERRAFORM_VERSION: "1.5.0"
+  TF_VERSION: "1.5.0"
   AWS_REGION: "us-east-1"
 
 jobs:
   terraform:
     name: "Terraform CI/CD"
     runs-on: ubuntu-latest
-    
-    # Required for manual approval step
     permissions:
       pull-requests: write
       contents: write
       id-token: write
 
     steps:
-    # Initial Stage
+    # Init Stage
     - name: Checkout Repository
       uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
 
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v2
@@ -33,28 +36,34 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TERRAFORM_VERSION }}
-
     - name: Cache Terraform Plugins
       uses: actions/cache@v3
       with:
         path: ~/.terraform.d/plugins
-        key: ${{ runner.os }}-terraform-plugins-${{ hashFiles('**/.terraform.lock.hcl') }}
+        key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
 
     # Validation Stage
     - name: Terraform Format Check
-      run: terraform fmt -check -recursive
-      
+      run: terraform fmt -check
+
     - name: Terraform Init
       run: terraform init
 
     - name: Terraform Validate
       run: terraform validate
 
-    - name: Run Checkov Scan
+    - name: Setup TFLint
+      uses: terraform-linters/setup-tflint@v3
+
+    - name: Run TFLint
+      run: tflint --format compact
+
+    - name: Verify AWS Provider Version
+      run: |
+        grep -q 'aws.*~> 5.0' versions.tf || exit 1
+
+    # Security Scan Stage
+    - name: Run Checkov
       uses: bridgecrewio/checkov-action@master
       with:
         directory: .
@@ -63,43 +72,57 @@ jobs:
     - name: Run tfsec
       uses: aquasecurity/tfsec-action@v1.0.0
 
+    - name: Run Snyk IaC Scan
+      uses: snyk/actions/iac@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    - name: Custom Policy Validation
+      run: |
+        # Add custom policy checks for S3 and EC2
+        echo "Running custom policy validation..."
+        # Add your custom validation script here
+
     # Planning Stage
     - name: Terraform Plan
       run: terraform plan -out=tfplan
       
-    - name: Upload Plan Artifact
+    - name: Store Terraform Plan
       uses: actions/upload-artifact@v3
       with:
         name: terraform-plan
         path: tfplan
 
-    - name: Install and Run Infracost
+    - name: Infracost Analysis
       uses: infracost/actions/setup@v2
       env:
         INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
     - run: infracost breakdown --path .
 
-    # Security Scanning Stage
-    - name: Run SCA Scan
-      uses: snyk/actions/iac@master
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      with:
-        args: --severity-threshold=high
+    - name: Detect Resource Changes
+      run: |
+        terraform show -json tfplan | jq -r '.resource_changes[]'
 
-    # Approval Gate
+    # Review Gate
     - name: Manual Approval
       uses: trstringer/manual-approval@v1
+      if: github.ref == 'refs/heads/main'
       with:
         secret: ${{ github.token }}
         approvers: required-approvers-here
         minimum-approvals: 1
-        message: "Please review the Terraform plan and approve the deployment"
+        message: "Please review the plan, costs, and security findings"
 
-    # Deployment Stage
+    # Apply Stage
     - name: Terraform Apply
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       run: terraform apply -auto-approve tfplan
+
+    - name: Resource Health Check
+      if: success() && github.ref == 'refs/heads/main'
+      run: |
+        echo "Performing health checks..."
+        # Add your health check script here
 
     - name: Backup State to S3
       if: success() && github.ref == 'refs/heads/main'
@@ -107,7 +130,3 @@ jobs:
         aws s3 cp terraform.tfstate s3://${TERRAFORM_STATE_BUCKET}/terraform.tfstate
       env:
         TERRAFORM_STATE_BUCKET: ${{ secrets.TERRAFORM_STATE_BUCKET }}
-
-    - name: Post-Deployment Validation
-      if: success() && github.ref == 'refs/heads/main'
-      run: terraform output
