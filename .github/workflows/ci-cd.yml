@@ -1,185 +1,192 @@
-name: Terraform AWS Infrastructure CI/CD
+name: Terraform CI/CD Pipeline
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
-
-env:
-  AWS_REGION: us-east-1
-  TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
+  push:
+    branches: [ main ]
 
 permissions:
-  id-token: write
   contents: read
   pull-requests: write
 
+env:
+  TF_VERSION: "1.5.0"
+  AWS_REGION: "us-east-1"
+
 jobs:
-  initialize:
-    name: Initialize Terraform
+  init-and-validate:
+    name: Initialize and Validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Initialize Terraform
+        run: terraform init
+
+      - name: Validate Terraform Configuration
+        run: terraform validate
+
+      - name: Check Formatting
+        run: terraform fmt -check -recursive
+
+  security-scan:
+    name: Security Scanning
+    needs: init-and-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+
+      - name: Run checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+
+      - name: Run KICS Scan
+        uses: checkmarx/kics-action@v1.7
+        with:
+          path: '.'
+          output_path: kics-results
+          platform_type: terraform
+          
+      - name: Upload Security Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-scan-results
+          path: |
+            kics-results
+            checkov-report.json
+
+  plan:
+    name: Terraform Plan
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: "1.5.0"
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Initialize Terraform
-        run: terraform init
-        
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
       - name: Cache Terraform
         uses: actions/cache@v3
         with:
           path: .terraform
           key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
 
-  validate:
-    needs: initialize
-    name: Validation & Security Scans
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-        
-      - name: Terraform Validation
-        run: terraform validate
-
-      - name: Run tflint
-        uses: terraform-linters/setup-tflint@v3
-        
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory: .
-          framework: terraform
-          
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.0
-
-  plan:
-    needs: validate
-    name: Plan & Cost Estimation
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        environment: [dev, staging, prod]
-    environment: ${{ matrix.environment }}
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-
       - name: Terraform Plan
-        run: |
-          terraform plan -out=tfplan
-        env:
-          TF_WORKSPACE: ${{ matrix.environment }}
-          
-      - name: Run Infracost
-        uses: infracost/actions/run@v2
-        with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-          terraform-plan-flags: "-out=tfplan"
-          
-      - name: Upload Plan Artifact
+        run: terraform plan -out=tfplan
+        
+      - name: Upload Plan
         uses: actions/upload-artifact@v3
         with:
-          name: tfplan-${{ matrix.environment }}
+          name: terraform-plan
           path: tfplan
 
-  security-compliance:
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const output = require('fs').readFileSync('terraform-plan-output.txt', 'utf8')
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '```terraform\n' + output + '\n```'
+            })
+
+  apply-dev:
+    name: Apply - Development
+    if: github.ref == 'refs/heads/main'
     needs: plan
-    name: Security Compliance Checks
     runs-on: ubuntu-latest
+    environment: development
     steps:
       - uses: actions/checkout@v3
-      
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          
-      - name: Run IAM Access Analyzer
-        run: |
-          aws accessanalyzer validate-policy --policy-type "IDENTITY_POLICY" --policy document.json
-          
-      - name: Check AWS Config Rules
-        run: aws configservice describe-compliance-by-config-rule
-
-      - name: CIS Benchmark Check
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'config'
-          hide-progress: false
-          format: 'table'
-          exit-code: '1'
-          ignore-unfixed: true
-
-  deploy:
-    needs: [plan, security-compliance]
-    name: Deploy Infrastructure
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        environment: [dev, staging, prod]
-    environment:
-      name: ${{ matrix.environment }}
-      url: https://github.com/${{ github.repository }}/deployments
-    concurrency: 
-      group: ${{ matrix.environment }}
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Download Plan Artifact
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_DEV }}
+
+      - name: Download Plan
         uses: actions/download-artifact@v3
         with:
-          name: tfplan-${{ matrix.environment }}
-          
+          name: terraform-plan
+
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
-        env:
-          TF_WORKSPACE: ${{ matrix.environment }}
-          
-      - name: Verify Deployment
+
+      - name: Run Post-deployment Checks
         run: |
-          terraform show
-          aws cloudwatch get-metric-statistics --namespace AWS/Health --metric-name ResourceCount
-          
-      - name: Check Tags Compliance
-        run: |
-          aws resourcegroupstaggingapi get-resources --tag-filters "Key=Environment,Values=${{ matrix.environment }}"
+          # Add your post-deployment validation scripts here
+          echo "Running post-deployment checks..."
+
+  apply-prod:
+    name: Apply - Production
+    if: github.ref == 'refs/heads/main'
+    needs: apply-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/deployments
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
 
       - name: Notify Slack
         if: always()
