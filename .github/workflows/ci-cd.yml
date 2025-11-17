@@ -1,151 +1,242 @@
-name: Terraform CI/CD Pipeline
+name: Terraform AWS Infrastructure CI/CD
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
 
+env:
+  AWS_REGION: us-east-1
+  TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+
+# Permissions required for OIDC authentication to AWS
 permissions:
   id-token: write
   contents: read
   pull-requests: write
 
-env:
-  TF_STATE_BUCKET: terraform-state
-  TF_LOCK_TABLE: terraform-lock
-  AWS_REGION: us-east-1
-
 jobs:
-  validate:
-    name: Validate
+  pre-commit:
+    name: Pre-Commit Checks
     runs-on: ubuntu-latest
     steps:
-      # Configure AWS Credentials
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.0"
+
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      # Validation Stage
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
-        
+
       - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}"
-        
+        run: terraform init -backend=false
+
       - name: Terraform Validate
         run: terraform validate
 
-  plan:
-    name: Plan
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}"
-
-      # Planning Stage
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
-        
-      - name: Upload Plan Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: tfplan
-          path: tfplan
-
-      - name: Cost Estimation
-        uses: infracost/actions/comment@v3
-        with:
-          path: .
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-  security:
-    name: Security Scan
-    needs: plan
+  security-scan:
+    name: Security Scanning
+    needs: pre-commit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      # Security Scanning Stage
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.0
-
-      - name: Run checkov
+      - name: Run Checkov
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
           framework: terraform
+          output_format: cli
+          soft_fail: true
 
-      - name: Run terrascan
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          soft_fail: true
+
+      - name: Run KICS Scan
+        uses: checkmarx/kics-github-action@v1.7
+        with:
+          path: '.'
+          output_path: kics-results
+          platform_type: terraform
+          fail_on: high
+
+      - name: Run Terrascan
         uses: tenable/terrascan-action@main
         with:
           iac_type: 'terraform'
-          iac_version: 'v14'
+          iac_dir: '.'
           policy_type: 'aws'
 
-      - name: Run Snyk IaC Scan
-        uses: snyk/actions/iac@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-  apply:
-    name: Apply
-    needs: [plan, security]
+  validation:
+    name: Terraform Validation
+    needs: security-scan
     runs-on: ubuntu-latest
-    environment: production
-    if: github.ref == 'refs/heads/main'
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.0"
+
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       - name: Terraform Init
-        run: terraform init -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" -backend-config="dynamodb_table=${{ env.TF_LOCK_TABLE }}"
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=dev/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
 
-      # Apply Stage
-      - name: Download Plan Artifact
-        uses: actions/download-artifact@v3
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        
+      - name: Generate Infracost Report
+        run: infracost breakdown --path=tfplan
+
+  testing:
+    name: Infrastructure Testing
+    needs: validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
         with:
-          name: tfplan
+          go-version: '1.20'
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Terratest
+        run: |
+          cd test
+          go test -v ./...
+
+  deploy-dev:
+    name: Deploy to Development
+    needs: testing
+    runs-on: ubuntu-latest
+    environment: development
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=dev/terraform.tfstate"
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
 
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
 
-      - name: Notify Slack on Apply
-        uses: slackapi/slack-github-action@v1.24.0
-        if: success()
+  deploy-staging:
+    name: Deploy to Staging
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: staging
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
         with:
-          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
-          slack-message: "Infrastructure changes applied successfully in ${{ github.repository }}"
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          terraform_version: "1.5.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=staging/terraform.tfstate"
+
+      - name: Terraform Workspace
+        run: terraform workspace select staging || terraform workspace new staging
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=prod/terraform.tfstate"
+
+      - name: Terraform Workspace
+        run: terraform workspace select production || terraform workspace new production
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
