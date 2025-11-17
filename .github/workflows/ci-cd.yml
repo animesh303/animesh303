@@ -1,0 +1,191 @@
+name: Terraform AWS Infrastructure CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKSPACE: ${{ github.event.inputs.environment || 'dev' }}
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  initialize:
+    name: Initialize Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.0"
+
+      - name: Initialize Terraform
+        run: terraform init
+        
+      - name: Cache Terraform
+        uses: actions/cache@v3
+        with:
+          path: .terraform
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+
+  validate:
+    needs: initialize
+    name: Validation & Security Scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        
+      - name: Terraform Validation
+        run: terraform validate
+
+      - name: Run tflint
+        uses: terraform-linters/setup-tflint@v3
+        
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+
+  plan:
+    needs: validate
+    name: Plan & Cost Estimation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    environment: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Plan
+        run: |
+          terraform plan -out=tfplan
+        env:
+          TF_WORKSPACE: ${{ matrix.environment }}
+          
+      - name: Run Infracost
+        uses: infracost/actions/run@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          terraform-plan-flags: "-out=tfplan"
+          
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: tfplan
+
+  security-compliance:
+    needs: plan
+    name: Security Compliance Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Run IAM Access Analyzer
+        run: |
+          aws accessanalyzer validate-policy --policy-type "IDENTITY_POLICY" --policy document.json
+          
+      - name: Check AWS Config Rules
+        run: aws configservice describe-compliance-by-config-rule
+
+      - name: CIS Benchmark Check
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          hide-progress: false
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+
+  deploy:
+    needs: [plan, security-compliance]
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    environment:
+      name: ${{ matrix.environment }}
+      url: https://github.com/${{ github.repository }}/deployments
+    concurrency: 
+      group: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: tfplan-${{ matrix.environment }}
+          
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        env:
+          TF_WORKSPACE: ${{ matrix.environment }}
+          
+      - name: Verify Deployment
+        run: |
+          terraform show
+          aws cloudwatch get-metric-statistics --namespace AWS/Health --metric-name ResourceCount
+          
+      - name: Check Tags Compliance
+        run: |
+          aws resourcegroupstaggingapi get-resources --tag-filters "Key=Environment,Values=${{ matrix.environment }}"
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
